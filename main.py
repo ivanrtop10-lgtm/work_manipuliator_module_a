@@ -1,52 +1,49 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# Панель управления манипулятором - Модуль А
-
+import os
 import sys
+from pathlib import Path
+
+venv_base = Path(__file__).parent / ".venv"
+plugin_path = venv_base / "lib" / "python3.12" / "site-packages" / "PyQt5" / "Qt5" / "plugins" / "platforms"
+if plugin_path.exists():
+    os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = str(plugin_path)
+else:
+    try:
+        import PyQt5
+        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(
+            os.path.dirname(PyQt5.__file__), "Qt5", "plugins", "platforms"
+        )
+    except ImportError:
+        pass
+
 from datetime import datetime
 from collections import deque
-from math import pi
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtWidgets import QMainWindow, QApplication, QFileDialog
 
-USE_FAKE_API = True
-
-if USE_FAKE_API:
-    from fake_motion import RobotControl
-else:
-    try:
-        from motion.core import RobotControl
-    except ImportError:
-        print("motion-core-api не установлен")
-        sys.exit(1)
-
+from fake_motion import RobotControl
 
 class LogManager:
-    # Логгер - пишет в файл и хранит последние 3 записи
-    
-    def __init__(self, log_file="robot_logs.log", max_lines=3):
+    def __init__(self, log_file="robot_logs.log"):
         self.log_file = log_file
-        self.max_lines = max_lines
-        self.logs = deque(maxlen=max_lines)
+        self.logs = deque(maxlen=50)
         self._init_file()
-    
+
     def _init_file(self):
         with open(self.log_file, 'w', encoding='utf-8') as f:
+            f.write("Начало сессии: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + "\n")
             f.write("=" * 60 + "\n")
-            f.write("СЕССИЯ: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + "\n")
-            f.write("=" * 60 + "\n")
-    
-    def log(self, msg, level="INFO"):
+
+    def log(self, msg):
         time = datetime.now().strftime('%H:%M:%S')
-        full_msg = "[" + time + "] [" + level + "] " + msg
+        full_msg = time + " - " + msg
         with open(self.log_file, 'a', encoding='utf-8') as f:
             f.write(full_msg + "\n")
         self.logs.append(full_msg)
         return list(self.logs)
-    
+
     def get_logs(self):
         return list(self.logs)
-    
+
     def save_log(self, path):
         try:
             with open(self.log_file, 'r', encoding='utf-8') as f:
@@ -56,197 +53,49 @@ class LogManager:
         except:
             return False
 
-
 class RobotThread(QtCore.QThread):
-    # Поток для опроса статуса робота
-    
     signal = QtCore.pyqtSignal(dict)
-    
+
     def __init__(self, robot):
         super().__init__()
         self.robot = robot
         self.stop_flag = False
-    
+
     def run(self):
         while not self.stop_flag:
             try:
                 if self.robot and self.robot.connected:
                     temp = self.robot.getActualTemperature()
                     joints = self.robot.getMotorPositionRadians()
-                    
-                    data = {
-                        'temp': temp,
-                        'joints': joints
-                    }
+                    data = {'temp': temp, 'joints': joints}
                     self.signal.emit(data)
             except:
                 pass
             self.msleep(200)
-    
+
     def stop(self):
         self.stop_flag = True
         self.wait()
 
-
-class RobotCtrl:
-    # Контроллер для управления роботом
-    
-    def __init__(self, ip="192.168.2.100", logger=None):
-        self.ip = ip
-        self.log = logger.log if logger else lambda x,y=None: None
-        self.robot = None
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.logger = LogManager()
+        self.robot = RobotControl("192.168.2.100")
         self.thread = None
         self.connected = False
         self.engaged = False
         self.manual = False
         self.mode = "CART"
         self.state = "GRAY"
-        self.slider_values = [0.0] * 6
-    
-    def connect(self):
-        try:
-            self.log("Подключение к " + self.ip, "INFO")
-            self.robot = RobotControl(self.ip)
-            if self.robot.connect():
-                self.connected = True
-                self.state = "BLUE"
-                self.log("Подключено", "SUCCESS")
-                self.thread = RobotThread(self.robot)
-                self.thread.signal.connect(self._on_data)
-                self.thread.start()
-                return True
-            return False
-        except Exception as e:
-            self.log("Ошибка: " + str(e), "ERROR")
-            return False
-    
-    def disconnect(self):
-        if self.engaged:
-            self.disengage()
-        if self.thread:
-            self.thread.stop()
-        if self.robot:
-            self.robot.disconnect()
-            self.connected = False
-            self.state = "GRAY"
-            self.log("Отключено", "INFO")
-    
-    def engage(self):
-        if not self.connected:
-            return False
-        if self.robot.engage():
-            self.engaged = True
-            self.log("Двигатели ВКЛ", "SUCCESS")
-            return True
-        return False
-    
-    def disengage(self):
-        if not self.connected:
-            return False
-        if self.robot.disengage():
-            self.engaged = False
-            self.manual = False
-            self.state = "BLUE"
-            self.log("Двигатели ВЫКЛ", "INFO")
-            return True
-        return False
-    
-    def emergency(self):
-        self.log("АВАРИЯ", "CRITICAL")
-        try:
-            self.robot.disengage()
-            self.engaged = False
-            self.manual = False
-            self.state = "RED"
-        except:
-            pass
-    
-    def start_manual(self):
-        if not self.connected or not self.engaged:
-            return False
-        self.manual = True
-        self.state = "GREEN"
-        self.log("Ручной режим", "INFO")
-        return True
-    
-    def pause(self):
-        self.state = "YELLOW"
-        self.log("Пауза", "INFO")
-    
-    def toggle_mode(self):
-        if not self.connected:
-            return False
-        if self.mode == "CART":
-            if self.robot.manualJointMode():
-                self.mode = "JOINT"
-                self.log("Режим: JOINT", "INFO")
-                return True
-        else:
-            if self.robot.manualCartMode():
-                self.mode = "CART"
-                self.log("Режим: CART", "INFO")
-                return True
-        return False
-    
-    def move(self, vel):
-        if not self.engaged or not self.manual:
-            return False
-        vel = [max(-0.05, min(0.05, v)) for v in vel]
-        try:
-            if self.mode == "JOINT":
-                return self.robot.setJointVelocity(vel)
-            else:
-                return self.robot.setCartesianVelocity(vel)
-        except:
-            return False
-    
-    def stop_move(self):
-        if self.engaged:
-            self.move([0.0]*6)
-    
-    def to_start(self):
-        if self.connected:
-            self.log("На старт", "INFO")
-            return self.robot.moveToStart()
-        return False
-    
-    def move_l(self):
-        if self.connected:
-            return self.toggle_mode()
-        return False
-    
-    def gripper_open(self):
-        if self.robot.toolOFF():
-            self.log("Клешня ОТКРЫТА", "INFO")
-            return True
-        return False
-    
-    def gripper_close(self):
-        if self.robot.toolON():
-            self.log("Клешня ЗАКРЫТА", "INFO")
-            return True
-        return False
-    
-    def update_slider_value(self, idx, val):
-        self.slider_values[idx] = val
-    
-    def _on_data(self, data):
-        pass
-
-
-class MainWindow(QMainWindow):
-    # Основное окно приложения
-    
-    def __init__(self):
-        super().__init__()
-        self.logger = LogManager()
-        self.robot = RobotCtrl(logger=self.logger)
-        self.robot._on_data = self.update_table
+        self.object_counters = [0, 0, 0]
+        self.joystick_values = [0.0] * 6
+        
         self.timer = QtCore.QTimer()
         self.timer.setInterval(100)
         self.timer.timeout.connect(self.stop_move)
         
-        from design import Ui_MainWindow
+        from design2 import Ui_MainWindow
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
         self.setWindowTitle("Управление манипулятором")
@@ -255,36 +104,65 @@ class MainWindow(QMainWindow):
                        self.ui.rx, self.ui.ry, self.ui.rz]
         self.labels = [self.ui.label, self.ui.label_2, self.ui.label_3,
                       self.ui.label_4, self.ui.label_5, self.ui.label_6]
-        self.header_cart = ["X", "Y", "Z", "RX", "RY", "RZ"]
-        self.header_joint = ["J1", "J2", "J3", "J4", "J5", "J6"]
         
         for s in self.sliders:
             s.setRange(-100, 100)
             s.setValue(0)
             s.setEnabled(False)
         
-        # Настройка таблицы - 7 строк
-        self.ui.tableWidget.setRowCount(7)
+        # Таблица - 4 строки (как в design2.py)
+        self.ui.tableWidget.setRowCount(4)
         self.ui.tableWidget.setColumnCount(6)
         
+        # Поле для имени файла (вместо listWidget_2)
+        self.filename_input = QtWidgets.QLineEdit(self.ui.centralwidget)
+        self.filename_input.setGeometry(QtCore.QRect(1040, 560, 211, 31))
+        self.filename_input.setPlaceholderText("Введите имя файла")
+        self.filename_input.setText("default_log.txt")
+        
+        # Скрываем listWidget_2
+        if hasattr(self.ui, 'listWidget_2'):
+            self.ui.listWidget_2.hide()
+        
+        # Инициализация таблицы brak
+        self.init_brak_table()
+        
+        # Инициализация таблицы tableWidget_2
+        self.init_status_table()
+        
         self._create_traffic_light()
-        self.update_labels()
         self.connect_signals()
-        self.logger.log("Запуск", "INFO")
+        self.logger.log("Запуск")
         self.update_logs()
         self.update_traffic_light()
-    
+
+    def init_brak_table(self):
+        self.ui.brak.setColumnCount(2)
+        for i in range(3):
+            item = QtWidgets.QTableWidgetItem("0")
+            item.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.ui.brak.setItem(i, 0, item)
+            item_time = QtWidgets.QTableWidgetItem("-")
+            item_time.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.ui.brak.setItem(i, 1, item_time)
+
+    def init_status_table(self):
+        self.ui.tableWidget_2.setColumnCount(6)
+        self.ui.tableWidget_2.setRowCount(2)
+        for row in range(2):
+            for col in range(6):
+                item = QtWidgets.QTableWidgetItem("-")
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.ui.tableWidget_2.setItem(row, col, item)
+
     def _create_traffic_light(self):
-        # Создание индикатора состояния
         self.traffic_light = QtWidgets.QLabel(self.ui.centralwidget)
         self.traffic_light.setGeometry(QtCore.QRect(440, 360, 80, 80))
         self.traffic_light.setStyleSheet("""
             QLabel { background-color: #4a4a4a; border-radius: 40px; border: 4px solid #2a2a2a; }
         """)
-    
+
     def update_traffic_light(self):
-        # Обновление цвета светофора
-        state = self.robot.state
         colors = {
             "RED": ("#ff0000", "0 0 20px #ff0000"),
             "YELLOW": ("#ffaa00", "0 0 20px #ffaa00"),
@@ -292,212 +170,280 @@ class MainWindow(QMainWindow):
             "BLUE": ("#4444ff", "0 0 20px #4444ff"),
             "GRAY": ("#4a4a4a", "none")
         }
-        color, glow = colors.get(state, ("#4a4a4a", "none"))
+        color, glow = colors.get(self.state, ("#4a4a4a", "none"))
         self.traffic_light.setStyleSheet("""
             QLabel { background-color: %s; border-radius: 40px; border: 4px solid #2a2a2a; box-shadow: %s; }
         """ % (color, glow))
         
         msg = {"GRAY": "Выключена", "BLUE": "Ожидание", "GREEN": "Ручной", 
-               "YELLOW": "Пауза", "RED": "АВАРИЯ"}
-        self.ui.statusbar.showMessage(msg.get(state, ""))
-    
+                "YELLOW": "Пауза", "RED": "АВАРИЯ"}
+        self.ui.statusbar.showMessage(msg.get(self.state, ""))
+
     def connect_signals(self):
-        # Подключение кнопок
         self.ui.pushButton_3.clicked.connect(self.toggle_system)
         self.ui.rezim.clicked.connect(self.start_manual)
-        self.ui.off.clicked.connect(self.motors_off)
         self.ui.stop.clicked.connect(self.emergency)
         self.ui.pause.clicked.connect(self.pause)
         self.ui.pushButton.clicked.connect(self.to_start)
-        self.ui.pushButton_4.clicked.connect(self.move_l)
-        self.ui.open.clicked.connect(self.gripper_open)
-        self.ui.close.clicked.connect(self.gripper_close)
+        self.ui.pushButton_4.clicked.connect(self.move_l)  # Кнопка move l
+        self.ui.close.clicked.connect(self.toggle_gripper)
         self.ui.savesistem.clicked.connect(self.save_state)
         self.ui.save.clicked.connect(self.save_logs)
+        
+        self.ui.pushButton_2.clicked.connect(lambda: self.add_object_value(0))
+        self.ui.pushButton_5.clicked.connect(lambda: self.add_object_value(1))
+        self.ui.pushButton_6.clicked.connect(lambda: self.add_object_value(2))
+        
         for i, s in enumerate(self.sliders):
             s.valueChanged.connect(lambda v, idx=i: self.slider_move(idx, v))
-    
-    def update_labels(self):
-        # Обновление подписей
-        if self.robot.mode == "JOINT":
-            names = ["J1", "J2", "J3", "J4", "J5", "J6"]
-            headers = self.header_joint
-        else:
-            names = ["X", "Y", "Z", "RX", "RY", "RZ"]
-            headers = self.header_cart
-        for lbl, name in zip(self.labels, names):
-            lbl.setText(name)
-        self.ui.tableWidget.setHorizontalHeaderLabels(headers)
-    
+
     def toggle_system(self):
-        # Включение/выключение системы
-        if not self.robot.connected:
-            if self.robot.connect():
-                self.ui.pushButton_3.setText("ВЫКЛЮЧИТЬ СИСТЕМУ")
-                self.ui.pushButton_3.setStyleSheet("color: red; font-weight: bold; font-size: 17pt")
-                self.enable_controls(True)
-                self.update_traffic_light()
-                self.logger.log("Система включена", "INFO")
+        if not self.connected:
+            try:
+                if self.robot.connect():
+                    self.connected = True
+                    self.state = "BLUE"
+                    self.ui.pushButton_3.setText("ВЫКЛЮЧИТЬ СИСТЕМУ")
+                    self.ui.pushButton_3.setStyleSheet("color: red; font-weight: bold; font-size: 17pt")
+                    self.enable_controls(True)
+                    self.update_traffic_light()
+                    self.logger.log("Система включена")
+                    
+                    self.thread = RobotThread(self.robot)
+                    self.thread.signal.connect(self.update_table)
+                    self.thread.start()
+            except Exception as e:
+                self.logger.log("Ошибка: " + str(e))
         else:
-            self.robot.disconnect()
+            if self.engaged:
+                self.robot.disengage()
+                self.engaged = False
+            if self.thread:
+                self.thread.stop()
+            try:
+                self.robot.disconnect()
+            except:
+                pass
+            self.connected = False
+            self.state = "GRAY"
             self.ui.pushButton_3.setText("ВКЛЮЧЕНИЕ СИСТЕМЫ")
             self.ui.pushButton_3.setStyleSheet("color: green; font-weight: bold; font-size: 17pt")
             self.enable_controls(False)
             for s in self.sliders:
                 s.setEnabled(False)
-            self.logger.log("Система выключена", "INFO")
-    
+            self.logger.log("Система выключена")
+
     def start_manual(self):
-        # Запуск ручного режима
-        self.logger.log("Ручной режим запущен", "INFO")
+        if not self.connected:
+            return
         if self.robot.engage():
-            if self.robot.start_manual():
-                self.update_traffic_light()
-                for s in self.sliders:
-                    s.setEnabled(True)
-                self.update_logs()
-    
-    def motors_off(self):
-        # Выключение двигателей
-        self.logger.log("Двигатели ВЫКЛ", "INFO")
-        self.robot.disengage()
-        self.stop_move()
-        self.update_traffic_light()
-        for s in self.sliders:
-            s.setEnabled(False)
-        self.update_logs()
-    
+            self.engaged = True
+            self.logger.log("Двигатели ВКЛ")
+            if self.mode == "CART":
+                self.robot.manualCartMode()
+            else:
+                self.robot.manualJointMode()
+            self.manual = True
+            self.state = "GREEN"
+            self.update_traffic_light()
+            for s in self.sliders:
+                s.setEnabled(True)
+            self.update_logs()
+
     def emergency(self):
-        # Аварийная остановка
-        self.logger.log("АВАРИЙНАЯ ОСТАНОВКА", "CRITICAL")
-        self.robot.emergency()
+        self.logger.log("АВАРИЙНАЯ ОСТАНОВКА")
+        self.robot.disengage()
+        self.engaged = False
+        self.manual = False
+        self.state = "RED"
         self.stop_move()
         self.enable_controls(False)
         self.update_traffic_light()
         for s in self.sliders:
             s.setEnabled(False)
         self.update_logs()
-    
+
     def pause(self):
-        # Пауза
-        self.logger.log("Пауза", "INFO")
-        self.robot.pause()
-        self.update_traffic_light()
+        self.logger.log("Пауза")
+        self.state = "YELLOW"
         self.stop_move()
+        self.update_traffic_light()
         self.update_logs()
-    
+
     def to_start(self):
-        # Возврат на старт
-        self.logger.log("Возврат на старт", "INFO")
-        self.robot.to_start()
-        self.update_logs()
-    
-    def move_l(self):
-        # Переключение режима
-        if self.robot.move_l():
-            self.update_labels()
+        if self.connected:
+            self.logger.log("Возврат на старт")
+            self.robot.moveToStart()
             self.update_logs()
-    
-    def gripper_open(self):
-        # Открытие клешни
-        self.logger.log("Клешня ОТКРЫТА", "INFO")
-        self.robot.gripper_open()
+
+    def move_l(self):
+        # Кнопка move l - МЕНЯЕТ ТОЛЬКО НАЗВАНИЯ ДЖОЙСТИКОВ, таблицу не трогает
+        if self.connected:
+            if self.mode == "CART":
+                self.robot.manualJointMode()
+                self.mode = "JOINT"
+                # Меняем подписи на J1, J2, J3, J4, J5, J6
+                names = ["J1", "J2", "J3", "J4", "J5", "J6"]
+            else:
+                self.robot.manualCartMode()
+                self.mode = "CART"
+                # Меняем подписи на X, Y, Z, RX, RY, RZ
+                names = ["X", "Y", "Z", "RX", "RY", "RZ"]
+            
+            # Обновляем только подписи над слайдерами
+            for lbl, name in zip(self.labels, names):
+                lbl.setText(name)
+            
+            self.logger.log("Режим: " + self.mode)
+            self.update_logs()
+
+    def toggle_gripper(self):
+        current_text = self.ui.close.text()
+        if current_text == "закрытие гриппера":
+            if self.robot.toolON():
+                self.ui.close.setText("открытие гриппера")
+                self.ui.close.setStyleSheet("color: green")
+                self.logger.log("Гриппер ЗАКРЫТ")
+                self.update_gripper_table("ЗАКРЫТ")
+        else:
+            if self.robot.toolOFF():
+                self.ui.close.setText("закрытие гриппера")
+                self.ui.close.setStyleSheet("color: red")
+                self.logger.log("Гриппер ОТКРЫТ")
+                self.update_gripper_table("ОТКРЫТ")
         self.update_logs()
-    
-    def gripper_close(self):
-        # Закрытие клешни
-        self.logger.log("Клешня ЗАКРЫТА", "INFO")
-        self.robot.gripper_close()
-        self.update_logs()
-    
-    def slider_move(self, idx, val):
-        # Обработка слайдера
-        if not self.robot.engaged or not self.robot.manual:
-            return
+
+    def update_gripper_table(self, state):
+        for col in range(6):
+            item = QtWidgets.QTableWidgetItem(state)
+            item.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.ui.tableWidget_2.setItem(1, col, item)
+
+    def add_object_value(self, obj_index):
+        self.object_counters[obj_index] += 1
+        current_time = datetime.now().strftime('%H:%M:%S')
         
+        item_count = QtWidgets.QTableWidgetItem(str(self.object_counters[obj_index]))
+        item_count.setTextAlignment(QtCore.Qt.AlignCenter)
+        self.ui.brak.setItem(obj_index, 0, item_count)
+        
+        item_time = QtWidgets.QTableWidgetItem(current_time)
+        item_time.setTextAlignment(QtCore.Qt.AlignCenter)
+        self.ui.brak.setItem(obj_index, 1, item_time)
+        
+        obj_name = "1" if obj_index == 0 else "2" if obj_index == 1 else "брак"
+        self.logger.log("Объект " + obj_name + ": +1 (всего: " + str(self.object_counters[obj_index]) + ")")
+        self.update_logs()
+
+    def slider_move(self, idx, val):
+        if not self.engaged or not self.manual:
+            return
         vel = val / 2000.0
         vels = [0.0]*6
         vels[idx] = vel
         
-        # Сохраняем и обновляем таблицу
-        self.robot.update_slider_value(idx, vel)
-        self.update_slider_table(idx, vel)
+        # СОХРАНЯЕМ значение джойстика
+        self.joystick_values[idx] = val
         
-        # Отправляем команду роботу
-        self.robot.move(vels)
+        # Записываем в таблицу (строка 2 - радианы/джойстики)
+        self.update_joystick_table(idx, vel)
+        
+        if self.mode == "JOINT":
+            self.robot.setJointVelocity(vels)
+        else:
+            self.robot.setCartesianVelocity(vels)
         self.timer.start()
-    
+
     def stop_move(self):
-        # Остановка движения
+        # ОСТАНАВЛИВАЕМ движение, но НЕ СБРАСЫВАЕМ значения джойстиков в таблице
         self.timer.stop()
-        self.robot.stop_move()
-    
+        if self.engaged:
+            if self.mode == "JOINT":
+                self.robot.setJointVelocity([0.0]*6)
+            else:
+                self.robot.setCartesianVelocity([0.0]*6)
+        # Значения джойстиков остаются в таблице!
+
     def update_table(self, data):
-        # Обновление таблицы - ТОЛЬКО температура из API
         if not data:
             return
         
-        # Строка 0: Температура (обновляется каждые 200мс)
-        if data.get('temp'):
+        # Строка 0: Температура (из API)
+        if data.get('temp') is not None:
             temp = data['temp']
             for col in range(6):
                 item = QtWidgets.QTableWidgetItem(str(round(temp, 1)) + " C")
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
                 self.ui.tableWidget.setItem(0, col, item)
         
-        # Строка 2: НЕ ТРОГАЕМ! (остается от слайдеров)
-    
-    def update_slider_table(self, idx, val):
-        # Обновление строки 2 - значения остаются пока не тронешь слайдер снова
+        # Строка 1: Тики (из API)
+        if data.get('joints'):
+            joints = data['joints']
+            for col in range(6):
+                ticks = int(joints[col] * 1000)
+                item = QtWidgets.QTableWidgetItem(str(ticks))
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.ui.tableWidget.setItem(1, col, item)
+                
+                # Строка 3: Градусы (из API)
+                item_deg = QtWidgets.QTableWidgetItem(str(round(joints[col] * 180 / 3.14159, 2)))
+                item_deg.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.ui.tableWidget.setItem(3, col, item_deg)
+                
+                # Актуальная поза в tableWidget_2
+                item_pose = QtWidgets.QTableWidgetItem(str(round(joints[col], 3)))
+                item_pose.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.ui.tableWidget_2.setItem(0, col, item_pose)
+        # Строка 2 (радианы/джойстики) НЕ ТРОГАЕМ - остаётся последнее значение!
+
+    def update_joystick_table(self, idx, val):
+        # Обновление строки 2 - значения джойстиков
         item = QtWidgets.QTableWidgetItem(str(round(val, 4)))
         item.setTextAlignment(QtCore.Qt.AlignCenter)
         self.ui.tableWidget.setItem(2, idx, item)
-    
+
     def update_logs(self):
-        # Обновление списка логов
         self.ui.listWidget.clear()
         for log in self.logger.get_logs():
             item = QtWidgets.QListWidgetItem(log)
-            if "ERROR" in log or "CRITICAL" in log:
-                item.setForeground(QtGui.QColor("#ff4444"))
-            elif "WARN" in log:
-                item.setForeground(QtGui.QColor("#ffaa00"))
-            else:
-                item.setForeground(QtGui.QColor("#00aa00"))
+            item.setForeground(QtGui.QColor("#00aa00"))
             self.ui.listWidget.addItem(item)
         self.ui.listWidget.scrollToBottom()
-    
+
     def enable_controls(self, en):
-        # Включение кнопок
-        btns = [self.ui.rezim, self.ui.off, self.ui.stop, self.ui.pause,
+        btns = [self.ui.rezim, self.ui.stop, self.ui.pause,
                self.ui.pushButton, self.ui.pushButton_4, self.ui.savesistem,
-               self.ui.open, self.ui.close, self.ui.save]
+               self.ui.close, self.ui.save]
         for b in btns:
             b.setEnabled(en)
-    
+
     def save_logs(self):
-        # Сохранение логов
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить логи",
-            "log_" + datetime.now().strftime('%Y%m%d_%H%M%S') + ".txt",
-            "Text Files (*.txt)")
+        filename = self.filename_input.text().strip()
+        if not filename:
+            filename = "log_" + datetime.now().strftime('%Y%m%d_%H%M%S') + ".txt"
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить логи", filename, "Text Files (*.txt)")
         if path:
             if self.logger.save_log(path):
-                self.logger.log("Логи сохранены", "INFO")
+                self.logger.log("Логи сохранены в: " + path)
                 self.update_logs()
-    
-    def save_state(self):
-        # Сохранение состояния
-        self.logger.log("Состояние сохранено", "INFO")
-        self.update_logs()
-    
-    def closeEvent(self, ev):
-        # Закрытие приложения
-        self.logger.log("Завершение", "INFO")
-        self.timer.stop()
-        self.robot.disconnect()
-        ev.accept()
 
+    def save_state(self):
+        self.logger.log("Состояние сохранено")
+        self.update_logs()
+
+    def closeEvent(self, ev):
+        self.logger.log("Завершение")
+        self.timer.stop()
+        if self.thread:
+            self.thread.stop()
+        if self.robot and self.connected:
+            if self.engaged:
+                self.robot.disengage()
+            try:
+                self.robot.disconnect()
+            except:
+                pass
+        ev.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
